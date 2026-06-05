@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.cache/
+*.log
+*.pid
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+__pycache__/
+auth.json
+tokens.json
+profiles.json
+node_modules/

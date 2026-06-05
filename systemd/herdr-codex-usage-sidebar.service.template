@@ -1,0 +1,21 @@
+[Unit]
+Description=Publish compact Codex usage into Herdr sidebar metadata
+After=herdr-default.service
+Wants=herdr-default.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__HOME__
+Environment=HOME=__HOME__
+Environment=PATH=__BIN_DIR__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+__ENV_CODEX_USAGE_PROFILES__
+__ENV_CODEX_USAGE_LABEL_PREFIXES__
+__ENV_CODEX_USAGE_DEFAULT_PROFILE__
+__ENV_CODEX_USAGE_CACHE_DIR__
+ExecStart=__BIN_DIR__/herdr-codex-usage-sidebar 30
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

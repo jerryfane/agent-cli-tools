@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+interval="${1:-30}"
+source_id="${HERDR_CODEX_USAGE_SOURCE:-local:codex-usage-sidebar}"
+
+profile_label() {
+  local name="$1"
+  local item key value
+  IFS=',' read -ra items <<< "${CODEX_USAGE_LABEL_PREFIXES:-}"
+  for item in "${items[@]}"; do
+    key="${item%%=*}"
+    value="${item#*=}"
+    if [[ "$key" == "$name" && "$item" == *"="* ]]; then
+      printf '%s' "$value"
+      return
+    fi
+  done
+  printf '%s' "$name"
+}
+
+while :; do
+  profiles_json="$(codex-usage-api --profiles-json 2>/dev/null || printf '{}')"
+  mapfile -t profiles < <(codex-usage-api --list-profiles 2>/dev/null || true)
+  if ((${#profiles[@]} == 0)); then
+    sleep "$interval"
+    continue
+  fi
+
+  default_profile="${CODEX_USAGE_DEFAULT_PROFILE:-${profiles[0]}}"
+  declare -A statuses=()
+  declare -A labels=()
+  for profile in "${profiles[@]}"; do
+    [ -n "$profile" ] || continue
+    statuses["$profile"]="$(codex-usage-api --compact-profile "$profile" 2>/dev/null || printf '??%%5h ??%%wk')"
+    labels["$profile"]="$(profile_label "$profile")"
+  done
+
+  seq="$(date +%s%N)"
+  export CODEX_USAGE_PROFILES_JSON="$profiles_json"
+  export CODEX_USAGE_DEFAULT_PROFILE="$default_profile"
+  export CODEX_USAGE_PROFILE_NAMES="${profiles[*]}"
+
+  herdr pane list \
+    | python3 -c '
+import json
+import os
+import sys
+
+profile_names = [p for p in os.environ.get("CODEX_USAGE_PROFILE_NAMES", "").split() if p]
+default_profile = os.environ.get("CODEX_USAGE_DEFAULT_PROFILE") or (profile_names[0] if profile_names else "")
+payload = json.load(sys.stdin)
+for pane in payload.get("result", {}).get("panes", []):
+    if pane.get("agent") != "codex":
+        continue
+    label = (pane.get("label") or "").lower()
+    profile = default_profile
+    for name in profile_names:
+        if name.lower() in label:
+            profile = name
+            break
+    print("{}\t{}".format(pane["pane_id"], profile))
+' \
+    | while IFS=$'\t' read -r pane_id profile; do
+        [ -n "${pane_id:-}" ] || continue
+        [ -n "${profile:-}" ] || continue
+        status="${statuses[$profile]:-${statuses[$default_profile]:-??%5h ??%wk}}"
+        prefix="${labels[$profile]:-$profile}"
+        display_arg=(--display-agent "codex-$profile")
+        if [[ "$profile" == "$default_profile" ]]; then
+          display_arg=(--clear-display-agent)
+        fi
+
+        herdr pane report-metadata "$pane_id" \
+          --source "$source_id" \
+          --agent codex \
+          "${display_arg[@]}" \
+          --clear-custom-status \
+          --state-label "working=$prefix $status" \
+          --state-label "idle=$prefix $status" \
+          --state-label "blocked=$prefix $status" \
+          --state-label "done=$prefix $status" \
+          --state-label "unknown=$prefix $status" \
+          --seq "$seq" \
+          --ttl-ms "$((interval * 3000))" >/dev/null 2>&1 || true
+      done
+
+  profile_panes="$(python3 - <<'PY'
+from pathlib import Path
+import json
+import os
+import re
+
+profiles = json.loads(os.environ.get("CODEX_USAGE_PROFILES_JSON", "{}"))
+for proc in Path("/proc").glob("[0-9]*"):
+    try:
+        env_raw = proc.joinpath("environ").read_bytes().split(b"\0")
+        cmd = proc.joinpath("cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        continue
+
+    env = {}
+    for item in env_raw:
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        key = key.decode("utf-8", "replace")
+        if key in {"HERDR_PANE_ID", "CODEX_HOME", "HERDR_CODEX_PROFILE"}:
+            env[key] = value.decode("utf-8", "replace")
+
+    pane_id = env.get("HERDR_PANE_ID")
+    if not pane_id:
+        continue
+
+    profile = env.get("HERDR_CODEX_PROFILE", "")
+    codex_home = env.get("CODEX_HOME", "")
+    if profile not in profiles:
+        for name, home in profiles.items():
+            if codex_home == home:
+                profile = name
+                break
+    if profile not in profiles:
+        continue
+
+    print(f"{pane_id}\t{profile}")
+PY
+)"
+
+  while IFS=$'\t' read -r pane_id profile; do
+    [ -n "${pane_id:-}" ] || continue
+    [ -n "${profile:-}" ] || continue
+    status="${statuses[$profile]:-??%5h ??%wk}"
+    prefix="${labels[$profile]:-$profile}"
+    herdr pane report-metadata "$pane_id" \
+      --source "$source_id:profile" \
+      --agent codex \
+      --display-agent "codex-$profile" \
+      --clear-custom-status \
+      --state-label "working=$prefix $status" \
+      --state-label "idle=$prefix $status" \
+      --state-label "blocked=$prefix $status" \
+      --state-label "done=$prefix $status" \
+      --state-label "unknown=$prefix $status" \
+      --seq "$((seq + 1))" \
+      --ttl-ms "$((interval * 3000))" >/dev/null 2>&1 || true
+  done <<< "$profile_panes"
+
+  sleep "$interval"
+done

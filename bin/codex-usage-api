@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+DEFAULT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+TOKEN_URL = "https://auth.openai.com/oauth/token"
+CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+DEFAULT_MAX_AGE = 300
+
+
+class UsageError(Exception):
+    pass
+
+
+def now_epoch() -> float:
+    return time.time()
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def parse_profiles() -> dict[str, Path]:
+    configured = os.environ.get("CODEX_USAGE_PROFILES", "").strip()
+    if configured:
+        profiles: dict[str, Path] = {}
+        for item in configured.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise UsageError("CODEX_USAGE_PROFILES entries must be name=/path")
+            name, raw_path = item.split("=", 1)
+            name = name.strip()
+            if not name:
+                raise UsageError("CODEX_USAGE_PROFILES contains an empty profile name")
+            profiles[name] = Path(raw_path.strip()).expanduser()
+        if profiles:
+            return profiles
+
+    home = Path.home()
+    discovered = {
+        path.name.removeprefix(".codex-"): path
+        for path in sorted(home.glob(".codex-*"))
+        if path.is_dir() and path.joinpath("auth.json").exists()
+    }
+    if discovered:
+        return discovered
+    return {"default": home / ".codex"}
+
+
+def cache_dir() -> Path:
+    return Path(os.environ.get("CODEX_USAGE_CACHE_DIR", "~/.cache/codex-usage")).expanduser()
+
+
+def usage_cache_path() -> Path:
+    return cache_dir() / "profiles.json"
+
+
+def token_cache_path() -> Path:
+    return cache_dir() / "tokens.json"
+
+
+def lock_path() -> Path:
+    return cache_dir() / "profiles.lock"
+
+
+def ensure_private_dir() -> None:
+    directory = cache_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except PermissionError:
+        pass
+
+
+def write_private_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except PermissionError:
+        pass
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except PermissionError:
+        pass
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def load_auth(home: Path) -> dict:
+    auth_path = home / "auth.json"
+    try:
+        auth = json.loads(auth_path.read_text())
+    except FileNotFoundError as exc:
+        raise UsageError(f"missing {auth_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise UsageError(f"invalid JSON in {auth_path}") from exc
+    tokens = auth.get("tokens") or {}
+    for key in ("access_token", "account_id"):
+        if not tokens.get(key):
+            raise UsageError(f"missing {key} in {auth_path}")
+    return auth
+
+
+def refresh_access_token(refresh_token: str) -> dict:
+    if not refresh_token:
+        raise UsageError("missing refresh_token")
+    body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLIENT_ID,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise UsageError(f"token refresh failed with HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise UsageError(f"token refresh failed: {exc}") from exc
+    if not data.get("access_token"):
+        raise UsageError("token refresh response did not include access_token")
+    return data
+
+
+def token_cache_key(name: str, home: Path, account_id: str) -> str:
+    return f"{name}:{home}:{account_id}"
+
+
+def get_cached_token(name: str, home: Path, auth: dict, token_cache: dict) -> str:
+    tokens = auth.get("tokens") or {}
+    account_id = tokens.get("account_id", "")
+    key = token_cache_key(name, home, account_id)
+    cached = (token_cache.get("tokens") or {}).get(key) or {}
+    if cached.get("access_token") and float(cached.get("expires_at") or 0) > now_epoch() + 60:
+        return cached["access_token"]
+    return tokens["access_token"]
+
+
+def store_refreshed_token(name: str, home: Path, auth: dict, token_cache: dict, refreshed: dict) -> None:
+    tokens = auth.get("tokens") or {}
+    account_id = tokens.get("account_id", "")
+    key = token_cache_key(name, home, account_id)
+    token_cache.setdefault("tokens", {})[key] = {
+        "access_token": refreshed["access_token"],
+        "refresh_token": refreshed.get("refresh_token") or tokens.get("refresh_token"),
+        "expires_at": now_epoch() + int(refreshed.get("expires_in") or 3600),
+        "updated_at": utc_now_iso(),
+    }
+    write_private_json(token_cache_path(), token_cache)
+
+
+def fetch_usage(name: str, home: Path, token_cache: dict) -> dict:
+    auth = load_auth(home)
+    tokens = auth.get("tokens") or {}
+    access_token = get_cached_token(name, home, auth, token_cache)
+    account_id = tokens["account_id"]
+
+    for attempt in range(2):
+        req = urllib.request.Request(
+            os.environ.get("CODEX_USAGE_URL", DEFAULT_USAGE_URL),
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "chatgpt-account-id": account_id,
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403) and attempt == 0:
+                refresh_token = ((token_cache.get("tokens") or {}).get(token_cache_key(name, home, account_id)) or {}).get(
+                    "refresh_token"
+                ) or tokens.get("refresh_token")
+                refreshed = refresh_access_token(refresh_token)
+                store_refreshed_token(name, home, auth, token_cache, refreshed)
+                access_token = refreshed["access_token"]
+                continue
+            raise UsageError(f"usage fetch failed with HTTP {exc.code}") from exc
+        except Exception as exc:
+            raise UsageError(f"usage fetch failed: {exc}") from exc
+    raise UsageError("usage fetch failed after token refresh")
+
+
+def normalize_window(window: dict | None) -> dict:
+    window = window or {}
+    used = window.get("used_percent")
+    if isinstance(used, (int, float)):
+        used_value = max(0.0, min(100.0, float(used)))
+        remaining = max(0.0, min(100.0, 100.0 - used_value))
+    else:
+        used_value = None
+        remaining = None
+    reset_at = window.get("reset_at") or window.get("resets_at")
+    return {
+        "used_percent": used_value,
+        "remaining_percent": remaining,
+        "reset_at": reset_at if isinstance(reset_at, (int, float)) else None,
+        "window_seconds": window.get("limit_window_seconds"),
+    }
+
+
+def normalize_profile(name: str, home: Path, api_data: dict) -> dict:
+    rate_limit = api_data.get("rate_limit") or {}
+    return {
+        "name": name,
+        "home": str(home),
+        "plan": api_data.get("plan_type") or "unknown",
+        "allowed": rate_limit.get("allowed"),
+        "limit_reached": rate_limit.get("limit_reached"),
+        "rate_limit_reached_type": api_data.get("rate_limit_reached_type"),
+        "primary": normalize_window(rate_limit.get("primary_window")),
+        "secondary": normalize_window(rate_limit.get("secondary_window")),
+        "fetched_at": utc_now_iso(),
+        "source": "api",
+    }
+
+
+def parse_iso_epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def profile_age(profile: dict) -> float | None:
+    fetched = parse_iso_epoch(profile.get("fetched_at"))
+    if fetched is None:
+        return None
+    return max(0.0, now_epoch() - fetched)
+
+
+def cache_is_fresh(cache: dict, profiles: dict[str, Path], max_age: int) -> bool:
+    cached_profiles = cache.get("profiles") or {}
+    if set(cached_profiles) != set(profiles):
+        return False
+    for profile in cached_profiles.values():
+        age = profile_age(profile)
+        if age is None or age > max_age:
+            return False
+    return True
+
+
+def refresh_cache(profiles: dict[str, Path], max_age: int, force: bool) -> dict:
+    ensure_private_dir()
+    with lock_path().open("a+") as lock:
+        try:
+            os.chmod(lock_path(), 0o600)
+        except PermissionError:
+            pass
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        cache = read_json(usage_cache_path())
+        if not force and cache_is_fresh(cache, profiles, max_age):
+            cache["source"] = "cache"
+            return cache
+
+        token_cache = read_json(token_cache_path())
+        profile_cache = dict(cache.get("profiles") or {})
+        for name, home in profiles.items():
+            existing = profile_cache.get(name) or {}
+            age = profile_age(existing)
+            if not (force or age is None or age > max_age):
+                continue
+            try:
+                api_data = fetch_usage(name, home, token_cache)
+                profile_cache[name] = normalize_profile(name, home, api_data)
+            except UsageError as exc:
+                if existing:
+                    fallback = dict(existing)
+                    fallback["source"] = "cache"
+                    fallback["error"] = str(exc)
+                    profile_cache[name] = fallback
+                else:
+                    profile_cache[name] = {
+                        "name": name,
+                        "home": str(home),
+                        "source": "error",
+                        "error": str(exc),
+                        "fetched_at": None,
+                        "primary": {},
+                        "secondary": {},
+                    }
+
+        result = {
+            "generated_at": utc_now_iso(),
+            "source": "api",
+            "profiles": profile_cache,
+        }
+        write_private_json(usage_cache_path(), result)
+        return result
+
+
+def percent_text(value: object) -> str:
+    if isinstance(value, (int, float)):
+        return f"{value:.0f}%"
+    return "??%"
+
+
+def compact(profile: dict) -> str:
+    primary = (profile.get("primary") or {}).get("remaining_percent")
+    secondary = (profile.get("secondary") or {}).get("remaining_percent")
+    return f"{percent_text(primary)}5h {percent_text(secondary)}wk"
+
+
+def fmt_duration(seconds: int) -> str:
+    seconds = max(0, seconds)
+    mins, secs = divmod(seconds, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m {secs}s"
+
+
+def fmt_reset(epoch: object, include_date: bool = False) -> str:
+    if not isinstance(epoch, (int, float)):
+        return "reset unknown"
+    reset = dt.datetime.fromtimestamp(epoch, dt.timezone.utc).astimezone()
+    stamp = f"{reset:%Y-%m-%d %H:%M:%S %Z}" if include_date else f"{reset:%H:%M:%S %Z}"
+    return f"{stamp} ({fmt_duration(int(epoch - now_epoch()))})"
+
+
+def source_text(profile: dict) -> str:
+    source = profile.get("source") or "unknown"
+    age = profile_age(profile)
+    if source == "api" and age is not None:
+        return "api fresh" if age < 10 else f"api cache {fmt_duration(int(age))} old"
+    if source == "cache" and age is not None:
+        suffix = f"; {profile['error']}" if profile.get("error") else ""
+        return f"stale cache {fmt_duration(int(age))} old{suffix}"
+    if profile.get("error"):
+        return f"error: {profile['error']}"
+    return source
+
+
+def print_text(cache: dict, profiles: dict[str, Path]) -> None:
+    print(f"Codex usage remaining  {dt.datetime.now().astimezone():%Y-%m-%d %H:%M:%S %Z}")
+    for index, name in enumerate(profiles):
+        profile = (cache.get("profiles") or {}).get(name) or {}
+        print()
+        print(f"{name:<8} {compact(profile)}")
+        print(f"         source: {source_text(profile)}")
+        print(f"         5h reset: {fmt_reset((profile.get('primary') or {}).get('reset_at'))}")
+        print(f"         wk reset: {fmt_reset((profile.get('secondary') or {}).get('reset_at'), include_date=True)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fetch Codex quota usage for one or more local Codex profiles.")
+    parser.add_argument("--json", action="store_true", help="print normalized JSON")
+    parser.add_argument("--profiles-json", action="store_true", help="print discovered profile homes as JSON")
+    parser.add_argument("--list-profiles", action="store_true", help="print profile names")
+    parser.add_argument("--compact-profile", help="print NN%%5h NN%%wk for one profile")
+    parser.add_argument("--max-age", type=int, default=DEFAULT_MAX_AGE, help="cache TTL in seconds")
+    parser.add_argument("--force-refresh", action="store_true", help="bypass cache once")
+    args = parser.parse_args()
+
+    try:
+        profiles = parse_profiles()
+    except UsageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.list_profiles:
+        print("\n".join(profiles))
+        return 0
+    if args.profiles_json:
+        print(json.dumps({name: str(home) for name, home in profiles.items()}, indent=2, sort_keys=True))
+        return 0
+
+    cache = refresh_cache(profiles, max(0, args.max_age), args.force_refresh)
+    if args.json:
+        print(json.dumps(cache, indent=2, sort_keys=True))
+        return 0
+    if args.compact_profile:
+        profile = (cache.get("profiles") or {}).get(args.compact_profile) or {}
+        print(compact(profile))
+        return 0
+    print_text(cache, profiles)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

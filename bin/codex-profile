@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import stat
 import sys
 import time
@@ -164,6 +165,68 @@ def write_wrapper(name: str, home: Path, directory: Path) -> Path:
     return path
 
 
+def state_summary(home: Path) -> tuple[int, str | None]:
+    path = home / "state_5.sqlite"
+    if not path.exists() or path.is_symlink():
+        return 0, None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        threads = int(conn.execute("select count(*) from threads").fetchone()[0])
+        row = conn.execute("select status from backfill_state where id=1").fetchone()
+        status = str(row[0]) if row else None
+        conn.close()
+        return threads, status
+    except sqlite3.Error:
+        return 0, None
+
+
+def candidate_profile_homes(base: Path) -> list[Path]:
+    return [
+        path
+        for path in sorted(base.parent.glob(".codex-*"))
+        if not path.is_symlink() and path.is_dir()
+    ]
+
+
+def best_seed_home(name: str, base: Path) -> Path | None:
+    best: tuple[int, Path] | None = None
+    for path in candidate_profile_homes(base):
+        if path.name == f".codex-{name}":
+            continue
+        threads, status = state_summary(path)
+        if status != "complete" or threads <= 0:
+            continue
+        if best is None or threads > best[0]:
+            best = (threads, path)
+    return best[1] if best else None
+
+
+def seed_state_from(source_home: Path, dest_home: Path, changes: list[str]) -> bool:
+    source = source_home / "state_5.sqlite"
+    dest = dest_home / "state_5.sqlite"
+    if not source.exists() or source.is_symlink():
+        return False
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(dest) + suffix)
+        if path.exists() or path.is_symlink():
+            backup = path.with_name(f"{path.name}.codex-profile-seed-{stamp}.bak")
+            counter = 1
+            while backup.exists() or backup.is_symlink():
+                backup = path.with_name(f"{path.name}.codex-profile-seed-{stamp}.{counter}.bak")
+                counter += 1
+            path.rename(backup)
+            changes.append(f"backed up {path} to {backup}")
+    source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    dest_conn = sqlite3.connect(dest)
+    source_conn.backup(dest_conn)
+    dest_conn.close()
+    source_conn.close()
+    shutil.copymode(source, dest)
+    changes.append(f"seeded {dest} from {source}")
+    return True
+
+
 def create_profile(args: argparse.Namespace) -> int:
     name = normalize_name(args.name)
     base = base_home()
@@ -187,6 +250,11 @@ def create_profile(args: argparse.Namespace) -> int:
     write_text_if_missing(home / "installation_id", f"{uuid.uuid4()}\n")
 
     wrapper = write_wrapper(name, home, bin_dir())
+    changes: list[str] = []
+    seed = best_seed_home(name, base)
+    if seed and seed_state_from(seed, home, changes):
+        for change in changes:
+            print(f"ok   {change}")
     print(f"created profile {name}: {home}")
     print(f"created wrapper: {wrapper}")
     print(f"next: codex-{name} login")
@@ -216,6 +284,17 @@ def check_profile(name: str, repair: bool = False) -> tuple[list[str], list[str]
             changes.append(f"created wrapper {wrapper}")
         else:
             errors.append(f"wrapper missing: {wrapper}")
+
+    threads, status = state_summary(home)
+    if status != "complete":
+        if repair:
+            seed = best_seed_home(name, base)
+            if seed and seed_state_from(seed, home, changes):
+                pass
+            elif status == "running":
+                errors.append(f"{home / 'state_5.sqlite'} backfill is stuck running and no complete seed profile was found")
+        elif status == "running":
+            errors.append(f"{home / 'state_5.sqlite'} backfill is stuck running; run codex-profile repair {name}")
 
     return errors, changes
 
@@ -252,9 +331,7 @@ def repair_profile(args: argparse.Namespace) -> int:
 def list_profiles(args: argparse.Namespace) -> int:
     base = base_home()
     failures = 0
-    for path in sorted(base.parent.glob(".codex-*")):
-        if path.is_symlink() or not path.is_dir():
-            continue
+    for path in candidate_profile_homes(base):
         name = path.name.removeprefix(".codex-")
         try:
             errors, _ = check_profile(name, repair=False)
@@ -263,7 +340,9 @@ def list_profiles(args: argparse.Namespace) -> int:
         status = "ok" if not errors else "fail"
         if errors:
             failures += 1
-        print(f"{name}\t{status}\t{path}")
+        threads, backfill = state_summary(path)
+        suffix = f"\tthreads={threads}\tbackfill={backfill or 'unknown'}"
+        print(f"{name}\t{status}\t{path}{suffix}")
     return 1 if failures else 0
 
 

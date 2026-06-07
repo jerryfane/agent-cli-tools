@@ -49,6 +49,7 @@ codex-spark resume <session-id> --yolo
 ```
 
 The profile layout keeps auth and local state private, while sharing sessions, goals, skills, and plugins with the base Codex home.
+When another local profile already has a complete Codex session index, `codex-profile create` seeds the new profile from it to avoid the first-run backfill timeout.
 
 Repair a profile after Codex's own repair flow or a manual setup mistake:
 
@@ -58,6 +59,7 @@ codex-profile doctor spark
 ```
 
 This specifically checks for the dangerous mixed SQLite layout where `goals_1.sqlite` is private but `goals_1.sqlite-wal` and `goals_1.sqlite-shm` still point to the shared base DB.
+It also repairs a stuck `state_5.sqlite` backfill by seeding from a healthy sibling profile when one exists.
 
 Full usage view:
 

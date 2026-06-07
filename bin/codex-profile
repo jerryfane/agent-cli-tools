@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+import time
+import uuid
+
+
+SHARED_ENTRIES = ("sessions", "skills", "plugins")
+SHARED_GOAL_FILES = ("goals_1.sqlite", "goals_1.sqlite-wal", "goals_1.sqlite-shm")
+PRIVATE_SQLITE_FILES = (
+    "state_5.sqlite",
+    "state_5.sqlite-wal",
+    "state_5.sqlite-shm",
+    "logs_2.sqlite",
+    "logs_2.sqlite-wal",
+    "logs_2.sqlite-shm",
+    "memories_1.sqlite",
+    "memories_1.sqlite-wal",
+    "memories_1.sqlite-shm",
+)
+PROFILE_DIRS = ("cache", "log", "memories", "shell_snapshots", "tmp", ".tmp")
+COPY_IF_PRESENT = (
+    ".personality_migration",
+    "models_cache.json",
+    "version.json",
+)
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+class ProfileError(Exception):
+    pass
+
+
+def normalize_name(raw: str) -> str:
+    name = raw.strip()
+    for prefix in (".codex-", "codex-"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+    if not NAME_RE.fullmatch(name):
+        raise ProfileError("profile name must match [A-Za-z0-9][A-Za-z0-9_-]*")
+    return name
+
+
+def base_home() -> Path:
+    return Path(os.environ.get("CODEX_PROFILE_BASE_HOME", "~/.codex")).expanduser().resolve()
+
+
+def bin_dir() -> Path:
+    return Path(os.environ.get("CODEX_PROFILE_BIN_DIR", "~/.local/bin")).expanduser()
+
+
+def profile_home(name: str, base: Path) -> Path:
+    return base.parent / f".codex-{name}"
+
+
+def expected_target(base: Path, entry: str) -> Path:
+    return base / entry
+
+
+def same_target(path: Path, target: Path) -> bool:
+    return path.is_symlink() and os.readlink(path) == str(target)
+
+
+def backup_path(path: Path, reason: str) -> Path:
+    return path.with_name(f"{path.name}.{reason}-{time.strftime('%Y%m%d-%H%M%S')}.bak")
+
+
+def move_aside(path: Path, reason: str) -> Path | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    dest = backup_path(path, reason)
+    counter = 1
+    while dest.exists() or dest.is_symlink():
+        dest = path.with_name(f"{path.name}.{reason}-{time.strftime('%Y%m%d-%H%M%S')}.{counter}.bak")
+        counter += 1
+    path.rename(dest)
+    return dest
+
+
+def ensure_symlink(path: Path, target: Path, repair: bool, changes: list[str], errors: list[str]) -> None:
+    if same_target(path, target):
+        return
+    if path.exists() or path.is_symlink():
+        if not repair:
+            errors.append(f"{path} should symlink to {target}")
+            return
+        moved = move_aside(path, "codex-profile-repair")
+        if moved:
+            changes.append(f"moved {path} to {moved}")
+    if repair:
+        path.symlink_to(target)
+        changes.append(f"linked {path} -> {target}")
+
+
+def ensure_private_not_symlink(home: Path, name: str, repair: bool, changes: list[str], errors: list[str]) -> None:
+    path = home / name
+    if path.is_symlink():
+        if repair:
+            moved = move_aside(path, "codex-profile-repair")
+            if moved:
+                changes.append(f"moved private symlink {path} to {moved}")
+        else:
+            errors.append(f"{path} must be private, not a symlink")
+
+
+def copy_if_present(src: Path, dest: Path, mode: int | None = None) -> None:
+    if not src.exists() or dest.exists() or dest.is_symlink():
+        return
+    shutil.copy2(src, dest)
+    if mode is not None:
+        dest.chmod(mode)
+
+
+def write_text_if_missing(path: Path, text: str, mode: int | None = None) -> None:
+    if path.exists() or path.is_symlink():
+        return
+    path.write_text(text)
+    if mode is not None:
+        path.chmod(mode)
+
+
+def write_hooks(home: Path) -> None:
+    path = home / "hooks.json"
+    if path.exists() or path.is_symlink():
+        return
+    data = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "command": f"bash '{home / 'herdr-agent-state.sh'}' session",
+                            "timeout": 10,
+                            "type": "command",
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def write_wrapper(name: str, home: Path, directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"codex-{name}"
+    body = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        f"export CODEX_HOME={home}\n"
+        f"export HERDR_CODEX_PROFILE={name}\n\n"
+        'exec "${CODEX_PROFILE_CODEX_BIN:-codex}" "$@"\n'
+    )
+    path.write_text(body)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def create_profile(args: argparse.Namespace) -> int:
+    name = normalize_name(args.name)
+    base = base_home()
+    home = profile_home(name, base)
+    if not base.is_dir():
+        raise ProfileError(f"base Codex home does not exist: {base}")
+
+    home.mkdir(parents=True, exist_ok=True)
+    for dirname in PROFILE_DIRS:
+        (home / dirname).mkdir(exist_ok=True)
+
+    for entry in SHARED_ENTRIES + SHARED_GOAL_FILES:
+        ensure_symlink(home / entry, expected_target(base, entry), True, [], [])
+
+    copy_if_present(base / "config.toml", home / "config.toml", 0o600)
+    copy_if_present(base / "herdr-agent-state.sh", home / "herdr-agent-state.sh", 0o755)
+    for entry in COPY_IF_PRESENT:
+        copy_if_present(base / entry, home / entry)
+    write_hooks(home)
+    write_text_if_missing(home / "history.jsonl", "", 0o600)
+    write_text_if_missing(home / "installation_id", f"{uuid.uuid4()}\n")
+
+    wrapper = write_wrapper(name, home, bin_dir())
+    print(f"created profile {name}: {home}")
+    print(f"created wrapper: {wrapper}")
+    print(f"next: codex-{name} login")
+    return 0
+
+
+def check_profile(name: str, repair: bool = False) -> tuple[list[str], list[str]]:
+    base = base_home()
+    home = profile_home(name, base)
+    errors: list[str] = []
+    changes: list[str] = []
+
+    if not home.is_dir():
+        errors.append(f"profile home missing: {home}")
+        return errors, changes
+
+    for entry in SHARED_ENTRIES + SHARED_GOAL_FILES:
+        ensure_symlink(home / entry, expected_target(base, entry), repair, changes, errors)
+
+    for entry in PRIVATE_SQLITE_FILES + ("auth.json", "history.jsonl", "config.toml", "hooks.json"):
+        ensure_private_not_symlink(home, entry, repair, changes, errors)
+
+    wrapper = bin_dir() / f"codex-{name}"
+    if not wrapper.exists():
+        if repair:
+            write_wrapper(name, home, bin_dir())
+            changes.append(f"created wrapper {wrapper}")
+        else:
+            errors.append(f"wrapper missing: {wrapper}")
+
+    return errors, changes
+
+
+def doctor_profile(args: argparse.Namespace) -> int:
+    name = normalize_name(args.name)
+    errors, _ = check_profile(name, repair=False)
+    if errors:
+        print(f"profile {name}: fail")
+        for error in errors:
+            print(f"fail {error}")
+        return 1
+    print(f"profile {name}: ok")
+    return 0
+
+
+def repair_profile(args: argparse.Namespace) -> int:
+    name = normalize_name(args.name)
+    errors, changes = check_profile(name, repair=True)
+    if errors:
+        print(f"profile {name}: repair incomplete")
+        for error in errors:
+            print(f"fail {error}")
+        return 1
+    if changes:
+        print(f"profile {name}: repaired")
+        for change in changes:
+            print(f"ok   {change}")
+    else:
+        print(f"profile {name}: ok")
+    return 0
+
+
+def list_profiles(args: argparse.Namespace) -> int:
+    base = base_home()
+    failures = 0
+    for path in sorted(base.parent.glob(".codex-*")):
+        if path.is_symlink() or not path.is_dir():
+            continue
+        name = path.name.removeprefix(".codex-")
+        try:
+            errors, _ = check_profile(name, repair=False)
+        except ProfileError as exc:
+            errors = [str(exc)]
+        status = "ok" if not errors else "fail"
+        if errors:
+            failures += 1
+        print(f"{name}\t{status}\t{path}")
+    return 1 if failures else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Create, inspect, and repair local Codex profile homes.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    create = sub.add_parser("create", help="create a new shared-session Codex profile")
+    create.add_argument("name")
+    create.set_defaults(func=create_profile)
+
+    doctor = sub.add_parser("doctor", help="validate one Codex profile layout")
+    doctor.add_argument("name")
+    doctor.set_defaults(func=doctor_profile)
+
+    repair = sub.add_parser("repair", help="repair one Codex profile layout")
+    repair.add_argument("name")
+    repair.set_defaults(func=repair_profile)
+
+    list_cmd = sub.add_parser("list", help="list discovered Codex profiles")
+    list_cmd.set_defaults(func=list_profiles)
+
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except ProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

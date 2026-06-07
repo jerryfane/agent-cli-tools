@@ -15,9 +15,15 @@ check() {
 }
 
 check "python3 on PATH" command -v python3
+check "codex-profile on PATH" command -v codex-profile
 check "codex-usage-api on PATH" command -v codex-usage-api
 check "codex-usage-all on PATH" command -v codex-usage-all
 check "herdr-codex-usage-sidebar on PATH" command -v herdr-codex-usage-sidebar
+
+if command -v codex-profile >/dev/null 2>&1; then
+  echo "profile layout:"
+  codex-profile list || failures=$((failures + 1))
+fi
 
 if command -v codex-usage-api >/dev/null 2>&1; then
   echo "profiles:"

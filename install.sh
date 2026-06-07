@@ -6,6 +6,7 @@ bin_dir="${INSTALL_BIN_DIR:-$HOME/.local/bin}"
 service_name="herdr-codex-usage-sidebar.service"
 
 install -d "$bin_dir"
+install -m 0755 "$repo_dir/bin/codex-profile" "$bin_dir/codex-profile"
 install -m 0755 "$repo_dir/bin/codex-usage-api" "$bin_dir/codex-usage-api"
 install -m 0755 "$repo_dir/bin/codex-usage-all" "$bin_dir/codex-usage-all"
 install -m 0755 "$repo_dir/bin/herdr-codex-usage-sidebar" "$bin_dir/herdr-codex-usage-sidebar"
@@ -71,13 +72,15 @@ if [ "${INSTALL_SYSTEMD:-1}" = "1" ] && command -v systemctl >/dev/null 2>&1; th
   if [ "$(id -u)" -eq 0 ]; then
     render_system_service >"/etc/systemd/system/$service_name"
     systemctl daemon-reload
-    systemctl enable --now "$service_name"
+    systemctl enable "$service_name"
+    systemctl restart "$service_name"
   else
     user_systemd="$HOME/.config/systemd/user"
     install -d "$user_systemd"
     render_user_service >"$user_systemd/$service_name"
     systemctl --user daemon-reload
-    systemctl --user enable --now "$service_name"
+    systemctl --user enable "$service_name"
+    systemctl --user restart "$service_name"
   fi
 else
   echo "Installed scripts only. Set INSTALL_SYSTEMD=1 and rerun to install the sidebar service." >&2
